@@ -89,6 +89,7 @@ from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_config import (
 from nemo_rl.models.megatron.draft.optimizer import (
     build_draft_optimizer_override_provider,
 )
+from nemo_rl.models.megatron.optimizer_state import precision_aware_state_loading
 from nemo_rl.utils.path_utils import (
     listdir,
     maybe_enable_msc,
@@ -2800,7 +2801,16 @@ def setup_model_and_optimizer(
     if should_load_checkpoint:
         if pre_load_checkpoint_hook is not None:
             pre_load_checkpoint_hook(state, model)
-        with _sync_consumed_samples_on_scheduler_load(state, scheduler):
+        checkpoint_optimizer = (
+            optimizer
+            if megatron_cfg.checkpoint.load_optim
+            and not megatron_cfg.checkpoint.finetune
+            else None
+        )
+        with (
+            precision_aware_state_loading(checkpoint_optimizer),
+            _sync_consumed_samples_on_scheduler_load(state, scheduler),
+        ):
             load_checkpoint(
                 state,
                 model,
