@@ -1722,6 +1722,30 @@ Depending on your data shape, you may want to change these values."""
         self._environment_server_routes = dict(routes)
         return dict(self._environment_server_routes)
 
+    async def run_evaluation(self, examples: list[dict]) -> AsyncGenerator[dict, None]:
+        """Stream raw Gym results without requiring training-token records.
+
+        Request failures remain sidecar results. An unexpected transport failure
+        terminates the stream; callers retain already recorded results and must
+        not treat missing rows as completed evaluations.
+        """
+        self._require_spinup()
+        if self._forest_training or self._token_capture_enabled:
+            raise ValueError("Raw evaluation requires a non-capture Gym actor")
+        normalize_media_in_examples(examples)
+        if any(is_nemo_gym_task(row) for row in examples):
+            _prepare_materialized_nemo_gym_rows(
+                examples, self.list_environment_server_routes()
+            )
+        results = self.rch.run_examples(
+            examples=examples,
+            head_server_config=self.head_server_config,
+            route_failures_to_sidecar=True,
+        )
+        for pending in results:
+            row, result = await pending
+            yield {"row_index": row["_rowidx"], "request": row, "result": result}
+
     @accepts_trace_context
     async def run_rollouts(
         self,
