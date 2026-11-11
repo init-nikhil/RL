@@ -13,6 +13,9 @@
 # limitations under the License.
 
 import argparse
+import asyncio
+import copy
+import json
 import os
 import pprint
 import time
@@ -46,11 +49,16 @@ from nemo_rl.environments.nemo_gym import (
     should_use_nemo_gym,
 )
 from nemo_rl.environments.utils import shutdown_environments
-from nemo_rl.experience.rollouts import run_nemo_gym_rollout_sync
+from nemo_rl.experience.rollouts import (
+    _bucket_nemo_gym_rows_by_instance,
+    _prepare_nemo_gym_rows,
+    run_nemo_gym_rollout_sync,
+)
 from nemo_rl.models.generation import (
     configure_generation_config,
     draft_full_refit_enabled,
 )
+from nemo_rl.models.generation.interfaces import GenerationSamplingParams
 from nemo_rl.models.generation.vllm.config import materialize_vllm_video_config
 from nemo_rl.models.policy.draft_config import draft_refit_enabled
 from nemo_rl.utils.config import (
@@ -85,6 +93,8 @@ def collect_trajectories(
     val_task_to_env: dict[str, EnvironmentInterface],
     logger: Logger,
     master_config: MasterConfig,
+    *,
+    raw_results: bool = False,
 ) -> None:
     """Run trajectory collection."""
     # common config/state items
@@ -95,7 +105,64 @@ def collect_trajectories(
 
     print("\n🔍 Running trajectory collection...", flush=True)
     generation_config = master_config.policy["generation"]
-    for val_batch in val_dataloader:
+    row_offset = 0
+    for batch_index, val_batch in enumerate(val_dataloader):
+        if raw_results:
+            rows = copy.deepcopy(val_batch["extra_env_info"])
+            sampling = GenerationSamplingParams.from_generation_config(
+                generation_config
+            )
+            if (
+                sampling.top_k
+                or generation_config["stop_strings"]
+                or generation_config["stop_token_ids"]
+            ):
+                raise ValueError(
+                    "Raw Gym evaluation does not support top-k or stop overrides"
+                )
+            _prepare_nemo_gym_rows(rows, generation_config, sampling, 1)
+            buckets = _bucket_nemo_gym_rows_by_instance(
+                rows, val_task_to_env["nemo_gym"], 1
+            )
+            seen = set()
+
+            async def consume(handle, bucket_rows):
+                stream = handle.run_evaluation.options(num_returns="streaming").remote(
+                    bucket_rows
+                )
+                async for result_ref in stream:
+                    record = await result_ref
+                    index = record["row_index"]
+                    if (
+                        isinstance(index, bool)
+                        or not isinstance(index, int)
+                        or index < 0
+                        or index >= len(rows)
+                        or index in seen
+                    ):
+                        raise ValueError(
+                            f"Invalid or duplicate evaluation row index: {index}"
+                        )
+                    seen.add(index)
+                    record["evaluation_row_index"] = row_offset + index
+                    logger.log_string_list_as_jsonl([json.dumps(record)], log_filename)
+
+            async def consume_all():
+                await asyncio.gather(
+                    *(
+                        consume(handle, bucket_rows)
+                        for _, handle, bucket_rows in buckets
+                    )
+                )
+
+            asyncio.run(consume_all())
+            if len(seen) != len(rows):
+                raise ValueError(f"Evaluation returned {len(seen)} of {len(rows)} rows")
+            row_offset += len(rows)
+            logger.log_metrics(
+                {"recorded_rows": row_offset}, batch_index, prefix="collection"
+            )
+            continue
         nemo_gym_rollout_result = run_nemo_gym_rollout_sync(
             policy_generation=policy_generation,
             input_batch=val_batch,
@@ -207,6 +274,25 @@ def main() -> None:
     is_trajectory_collection = bool(
         config.env["nemo_gym"].pop("is_trajectory_collection", False)
     )
+    raw_results = bool(
+        config.env["nemo_gym"].pop("trajectory_collection_raw_results", False)
+    )
+    if raw_results and not is_trajectory_collection:
+        raise ValueError(
+            "trajectory_collection_raw_results requires trajectory collection"
+        )
+    collection_batch_size = config.env["nemo_gym"].pop(
+        "trajectory_collection_batch_size", None
+    )
+    if collection_batch_size is not None and (
+        not is_trajectory_collection
+        or not isinstance(collection_batch_size, int)
+        or isinstance(collection_batch_size, bool)
+        or collection_batch_size <= 0
+    ):
+        raise ValueError(
+            "trajectory_collection_batch_size requires collection mode and a positive integer"
+        )
     should_load_validation = is_trajectory_collection or (
         config.grpo.val_period > 0 or config.grpo.val_at_start or config.grpo.val_at_end
     )
@@ -240,6 +326,10 @@ The validation set you pass in will directly be used for validation with no addi
         )
         config.grpo.max_val_samples = len(val_dataset)
         config.grpo.val_batch_size = config.grpo.max_val_samples
+        if collection_batch_size is not None:
+            config.grpo.val_batch_size = min(
+                collection_batch_size, config.grpo.max_val_samples
+            )
 
     # Print config
     print("Final config:")
@@ -299,6 +389,7 @@ The validation set you pass in will directly be used for validation with no addi
                 val_task_to_env=val_task_to_env,
                 logger=logger,
                 master_config=master_config,
+                raw_results=raw_results,
             )
         # Check if async mode is enabled
         elif config.grpo.async_grpo.enabled:
@@ -372,6 +463,9 @@ The validation set you pass in will directly be used for validation with no addi
             policy_generation.shutdown()
         except Exception as error:
             print(f"Error shutting down generation: {error}", flush=True)
+        finally:
+            if is_trajectory_collection:
+                logger.finish()
 
 
 if __name__ == "__main__":
